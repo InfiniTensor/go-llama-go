@@ -1,6 +1,6 @@
 # Go, Llama, go!
 
-本仓库为 2025 年夏季 InfiniTensor 大模型与人工智能系统训练营 Triton & 九齿方向专业阶段的作业。
+本仓库为 InfiniTensor 大模型与人工智能系统训练营 Triton & 九齿方向专业阶段的作业。
 
 ## 任务说明
 
