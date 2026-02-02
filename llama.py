@@ -32,7 +32,7 @@ class ModelConfig:
 
     vocab_size: int
 
-
+# 加速点一
 @triton.jit
 def rms_norm_kernel(
     X, Y, W, 
@@ -84,7 +84,7 @@ class RMSNorm(nn.Module):
             )
             return y.view(*orig_shape)
 
-
+# 加速点二
 @triton.jit
 def mlp_fused_kernel(
     gate_ptr, up_ptr, out_ptr,
@@ -149,10 +149,199 @@ class MLP(nn.Module):
         
         # 3. 执行最后的下投影
         return self.down_proj(fused_out)
-        
-        
+
+# 加速点三 
+# ==========================================
+# Triton RoPE (旋转位置编码) 融合算子
+# ==========================================
+
+@triton.jit
+def rope_kernel(
+    q_ptr,           # Query/Key 输入指针 (Batch, Seq, Head, Dim)
+    cos_ptr,         # Cos 表指针 (Seq, Dim)
+    sin_ptr,         # Sin 表指针 (Seq, Dim)
+    out_ptr,         # 输出指针
+    q_row_stride,    # Q 的行跨度 (通常是 Head * Dim)
+    q_head_stride,   # Q 的头跨度 (通常是 Dim)
+    cos_row_stride,  # Cos 的行跨度
+    sin_row_stride,  # Sin 的行跨度
+    n_seq,           # 序列长度
+    n_head,          # 头数
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr, # 也就是 Dim
+    HALF_DIM: tl.constexpr  # Dim // 2
+):
+    # 并行策略：每个 Program 处理一个 (Seq, Head) 组合
+    # Grid: (n_seq, n_head * batch_size)
+    # pid_seq = tl.program_id(0)
+    # pid_bh  = tl.program_id(1) (Batch * Head)
+    
+    pid_seq = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    
+    # 1. 计算 Q/K 的内存偏移
+    # 这里的 q_ptr 已经包含了 batch 的偏移，所以在 Kernel 里只需要处理 seq 和 head
+    # 实际上为了简单，我们可以在外层就把 q_ptr 指向当前 Batch 的开始，或者把 Batch 维度合并到 pid_bh 中
+    # 假设输入是展平的 (Total_Seq, Head, Dim) 或者 stride 能够处理
+    
+    # 偏移量计算：
+    # Batch_Head_Index * Head_Stride + Seq_Index * Row_Stride (注意 Llama 的 layout)
+    # 原始 shape: (Batch, Seq, Head, Dim)
+    # 但 llama.py 里是 (Batch, Seq, Head, Dim)
+    # 对应的 stride: 
+    #   stride(0) = Seq * Head * Dim (Batch)
+    #   stride(1) = Head * Dim       (Seq)  <- q_row_stride
+    #   stride(2) = Dim              (Head) <- q_head_stride
+    #   stride(3) = 1
+    
+    # 我们用 grid (n_seq, batch * n_head)
+    # batch_id = pid_bh // n_head
+    # head_id  = pid_bh % n_head
+    
+    # 对应数据的指针位置：
+    # ptr = base + batch_id * stride_batch + seq_id * stride_seq + head_id * stride_head
+    # 为简化计算，我们在 Python 端可以直接传入 stride
+    
+    q_offset = pid_bh * q_head_stride + pid_seq * q_row_stride
+    cos_offset = pid_seq * cos_row_stride
+    
+    # 2. 加载 Cos 和 Sin
+    # RoPE 的特点：前半部分和后半部分共享 Cos/Sin，或者说对应位置
+    # Llama 采用 rotate_half: x[i] 与 x[i + half] 配对
+    # Cos/Sin 表通常也是 (Seq, Dim)
+    
+    # 加载前半部分索引 [0, 1, ... HALF_DIM-1]
+    offs_half = tl.arange(0, HALF_DIM)
+    
+    # 加载 Cos/Sin (前一半)
+    # 注意：generate_sin_and_cos_tables 生成的是完整 Dim 长度，但前后半部分值是一样的(对于 theta)
+    # 不过代码里是 cat 起来的，我们直接读对应位置即可
+    cos0 = tl.load(cos_ptr + cos_offset + offs_half)
+    sin0 = tl.load(sin_ptr + cos_offset + offs_half)
+    
+    # 3. 加载 Q/K 数据
+    # 加载前半部分 x_0
+    q0_ptr = q_ptr + q_offset + offs_half
+    q0 = tl.load(q0_ptr).to(tl.float32)
+    
+    # 加载后半部分 x_1
+    q1_ptr = q_ptr + q_offset + offs_half + HALF_DIM
+    q1 = tl.load(q1_ptr).to(tl.float32)
+    
+    # 4. 执行旋转 (Rotate Half)
+    # x_0_new = x_0 * cos - x_1 * sin
+    # x_1_new = x_0 * sin + x_1 * cos
+    
+    q0_out = q0 * cos0 - q1 * sin0
+    q1_out = q0 * sin0 + q1 * cos0
+    
+    # 5. 写回 (In-place 修改，节省显存)
+    tl.store(out_ptr + q_offset + offs_half, q0_out)
+    tl.store(out_ptr + q_offset + offs_half + HALF_DIM, q1_out)
+
+def triton_apply_rope(x, cos, sin):
+    # x shape: (Batch, Seq, Head, Dim)
+    # cos/sin shape: (Seq, Dim)
+    
+    batch, seq_len, n_head, head_dim = x.shape
+    half_dim = head_dim // 2
+    
+    # 创建输出张量 (或者直接 clone 后原地修改)
+    out = torch.empty_like(x)
+    
+    # 确保连续，否则 stride 可能会乱
+    # x = x.contiguous() 
+    # cos = cos.contiguous()
+    # sin = sin.contiguous()
+    
+    # 启动 Kernel
+    # Grid 维度: (Seq_Len, Batch * Num_Heads)
+    grid = (seq_len, batch * n_head)
+    
+    # stride 计算
+    # x.stride(1) 是 seq 维度的 stride
+    # x.stride(2) 是 head 维度的 stride
+    # 注意：如果 Batch * Head 被合并到了 grid[1]，我们需要手动计算 batch 带来的 stride 偏移
+    # 为了简化，我们假设 x 是 (Batch, Seq, Head, Dim) 布局
+    # 我们在 Kernel 里把 stride 传得更细一点
+    
+    # 这里有个小技巧：我们可以把 Batch 和 Head 视为一个大维度，
+    # 但前提是 Batch 和 Head 在内存上不一定是连续的（中间隔了 Seq）
+    # Llama 的 Tensor 布局通常是 (Batch, Seq, Head, Dim)
+    # 所以 Batch 维度 stride 最大，Seq 次之，Head 再次之
+    
+    # 为了适配 Kernel 的 (pid_bh * head_stride + pid_seq * row_stride) 公式：
+    # pid_bh 包含了 batch 和 head。
+    # 真实的 offset = batch_idx * stride_b + head_idx * stride_h + seq_idx * stride_s
+    # = (pid_bh // n_head) * stride_b + (pid_bh % n_head) * stride_h + ...
+    # 这在 Kernel 里算太慢。
+    
+    # 简单方案：直接用 view 展平 Batch 和 Head？
+    # x.transpose(1, 2) -> (Batch, Head, Seq, Dim).reshape(-1, Seq, Dim)
+    # 这样内存就需要拷贝了，得不偿失。
+    
+    # 最佳方案：直接在 Kernel 里传 stride
+    # 但我们不想在 Kernel 做除法。
+    # 妥协方案：只针对 seq 维度并行，内部循环 batch 和 head？不，并行度不够。
+    
+    # 让我们修正 Kernel 逻辑：
+    # 传入 stride_batch, stride_seq, stride_head
+    
+    rope_kernel_advanced[(seq_len, batch * n_head)](
+        x, cos, sin, out,
+        x.stride(0), x.stride(1), x.stride(2), # stride_batch, stride_seq, stride_head
+        cos.stride(0), sin.stride(0),
+        BLOCK_SIZE=triton.next_power_of_2(half_dim),
+        HEAD_DIM=head_dim,
+        HALF_DIM=half_dim,
+        N_HEAD=n_head # 传进去做取模运算
+    )
+    return out
+
+# 修正后的 Kernel (支持非连续维度的 Batch/Head)
+@triton.jit
+def rope_kernel_advanced(
+    q_ptr, cos_ptr, sin_ptr, out_ptr,
+    stride_batch, stride_seq, stride_head,
+    cos_stride_seq, sin_stride_seq,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HALF_DIM: tl.constexpr,
+    N_HEAD: tl.constexpr
+):
+    pid_seq = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    
+    # 反解 Batch 和 Head ID
+    batch_id = pid_bh // N_HEAD
+    head_id = pid_bh % N_HEAD
+    
+    # 计算 Q 的偏移
+    q_offset = batch_id * stride_batch + pid_seq * stride_seq + head_id * stride_head
+    
+    # 计算 Cos/Sin 的偏移 (只跟 Seq 有关)
+    cos_offset = pid_seq * cos_stride_seq
+    
+    offs = tl.arange(0, HALF_DIM)
+    
+    # 加载
+    cos = tl.load(cos_ptr + cos_offset + offs)
+    sin = tl.load(sin_ptr + cos_offset + offs)
+    
+    q0 = tl.load(q_ptr + q_offset + offs).to(tl.float32)
+    q1 = tl.load(q_ptr + q_offset + offs + HALF_DIM).to(tl.float32)
+    
+    # 计算
+    out0 = q0 * cos - q1 * sin
+    out1 = q0 * sin + q1 * cos
+    
+    # 存储
+    tl.store(out_ptr + q_offset + offs, out0)
+    tl.store(out_ptr + q_offset + offs + HALF_DIM, out1)
+    
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
+    '''
     sin_table = sin_table[None, :, None, :]
     cos_table = cos_table[None, :, None, :]
 
@@ -162,7 +351,8 @@ def apply_rotary_position_embedding(input, sin_table, cos_table):
     input_1_rotated = input_0 * sin_table + input_1 * cos_table
 
     return torch.cat((input_0_rotated, input_1_rotated), dim=-1)
-
+    '''
+    return triton_apply_rope(input, cos_table, sin_table)
 
 def apply_scaled_dot_product_attention(query, key, value):
     _, num_heads_q, seq_len_q, emb_dim = query.shape
