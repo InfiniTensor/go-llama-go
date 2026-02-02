@@ -152,7 +152,7 @@ class MLP(nn.Module):
 
     def forward(self, input):
         #return self.down_proj(self.silu(self.gate_proj(input)) * self.up_proj(input))
-        '''
+        
         # 1. 执行前两个线性投影
         gate_out = self.gate_proj(input)
         up_out = self.up_proj(input)
@@ -173,7 +173,7 @@ class MLP(nn.Module):
         ninetoothed_mlp_op(gate_out, up_out, fused_out)
         
         return self.down_proj(fused_out)
-    
+        '''
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
     sin_table = sin_table[None, :, None, :]
