@@ -86,16 +86,33 @@ class RMSNorm(nn.Module):
             )
             return y.view(*orig_shape)
 
-'''
-# 使用 jit 装饰器将 Python 函数编译为 GPU 算子
-@nt.jit
-def ninetoothed_mlp_op(gate, up, out):
-    # 计算 SiLU: x * (1 / (1 + exp(-x)))
-    # 直接使用 nt 提供的数学函数
-    sig_g = 1.0 / (1.0 + nt.exp(-gate))
-    out = (gate * sig_g) * up
+
+mlp_fusion_code = """
+extern "C" __global__ void mlp_fusion(float* gate, float* up, float* out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i<n){
+        float g = gate[i];
+        float u = up[i];
+        // SiLU: x * sigmoid(x)
+        float sig = 1.0f / (1.0f + __expf(-g));
+        out[i] = g * sig * u;
+    }
+}
+"""
+mlp_kernel = nt.compile(mlp_fusion_code)
+
+def ninetoothed_mlp_fusion(gate, up):
+    n = gate.numel()
+    out = torch.empty_like(gate)
+    
+    # 设置执行配置 (Grid & Block)
+    block = 256
+    grid = (n + block - 1) // block
+    
+    # 启动 Kernel
+    mlp_kernel.launch(grid, block, gate, up, out, n)
     return out
-'''
+
 
 @triton.jit
 def mlp_fused_kernel(
@@ -152,7 +169,7 @@ class MLP(nn.Module):
 
     def forward(self, input):
         #return self.down_proj(self.silu(self.gate_proj(input)) * self.up_proj(input))
-        
+        '''
         # 1. 执行前两个线性投影
         gate_out = self.gate_proj(input)
         up_out = self.up_proj(input)
@@ -166,14 +183,11 @@ class MLP(nn.Module):
         gate_out = self.gate_proj(input)
         up_out = self.up_proj(input)
         
-        # 准备输出张量
-        fused_out = torch.empty_like(gate_out)
-        
-        # 直接调用，九齿会根据 Tensor 的 shape 自动映射线程
-        ninetoothed_mlp_op(gate_out, up_out, fused_out)
+        # 调用九齿优化版
+        fused_out = ninetoothed_mlp_fusion(gate_out, up_out)
         
         return self.down_proj(fused_out)
-        '''
+        
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
     sin_table = sin_table[None, :, None, :]
