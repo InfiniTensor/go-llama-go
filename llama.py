@@ -418,37 +418,23 @@ def apply_scaled_dot_product_attention(query, key, value):
     _, num_heads_k, seq_len_k, _ = key.shape
     _, num_heads_v, _, _ = value.shape
 
+    # GQA 处理
     key = key.repeat_interleave(num_heads_q // num_heads_k, 1)
     value = value.repeat_interleave(num_heads_q // num_heads_v, 1)
 
     scale = 1 / math.sqrt(emb_dim)
-    '''
-    attn_mask = torch.tril(
-        torch.full((seq_len_q, seq_len_k), True, device=query.device)
-    )
 
-    attn_output = torch.matmul(query, key.permute(0, 1, 3, 2)) * scale
-    attn_output = torch.where(attn_mask, attn_output, float("-inf"))
-    attn_output = torch.softmax(attn_output, dim=-1)
-    attn_output = torch.matmul(attn_output, value)
-
-    return attn_output
-    '''
     # 1. Q @ K.T
-    # 这一步目前还是用 torch.matmul，因为写 FP16 GEMM 很难
     attn_weights = torch.matmul(query, key.permute(0, 1, 3, 2))
     
-    # 2. 应用 Mask (PyTorch 原生)
-    # 如果要极致加速，这一步应该融合进 Softmax，但逻辑较复杂
-    # 我们先保留这一步，但去掉后面的 * scale 和 softmax
-    attn_mask = torch.tril(
-        torch.full((seq_len_q, seq_len_k), True, device=query.device)
-    )
-    attn_weights = torch.where(attn_mask, attn_weights, float("-inf"))
+    # 2. 应用 Mask (仅在 Prefill 阶段需要 causal mask)
+    if seq_len_q > 1:
+        attn_mask = torch.tril(
+            torch.full((seq_len_q, seq_len_k), True, device=query.device)
+        )
+        attn_weights = torch.where(attn_mask, attn_weights, float("-inf"))
     
-    # 3. Triton Softmax (融合了 Scale * x 和 Softmax)
-    # 替换原来的: 
-    # attn_output = torch.softmax(attn_weights * scale, dim=-1)
+    # 3. Triton Softmax
     attn_weights = triton_softmax(attn_weights, scale=scale)
     
     # 4. Score @ V
@@ -500,13 +486,29 @@ class Attention(nn.Module):
             key_states, sin_table, cos_table
         ).permute(0, 2, 1, 3)
 
+        # 加速点五
+        # KV Cache 逻辑
+        if past_key_value is not None:
+            # 如果有缓存，把新的 K, V 拼接到缓存后面
+            past_key, past_value = past_key_value
+            key_states = torch.cat((past_key, key_states), dim=2)
+            value_states = torch.cat((past_value, value_states), dim=2)
+        # 更新当前的缓存 (供下一步使用)
+        current_key_value = (key_states, value_states)
+
         attn_output = apply_scaled_dot_product_attention(
             query_states, key_states, value_states
         )
-
+        
+        '''
         return self.o_proj(
             attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
         )
+        '''
+
+        return self.o_proj(
+            attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        ), current_key_value
 
 
 class DecoderLayer(nn.Module):
@@ -521,6 +523,7 @@ class DecoderLayer(nn.Module):
 
         self.mlp = MLP(config.hidden_size, config.intermediate_size)
 
+    '''
     def forward(self, hidden_states, sin_table, cos_table):
         hidden_states += self.self_attn(
             self.input_layernorm(hidden_states), sin_table, cos_table
@@ -529,7 +532,17 @@ class DecoderLayer(nn.Module):
         hidden_states += self.mlp(self.post_attention_layernorm(hidden_states))
 
         return hidden_states
-
+    '''
+    def forward(self, hidden_states, sin_table, cos_table, past_key_value=None):
+        attn_output, current_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), 
+            sin_table, 
+            cos_table, 
+            past_key_value
+        )
+        hidden_states += attn_output
+        hidden_states += self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, current_key_value
 
 def generate_sin_and_cos_tables(seq_len, emb_dim, base, dtype, device):
     theta = base ** (
@@ -569,6 +582,7 @@ class Model(nn.Module):
 
         self.norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
 
+    '''
     def forward(self, input_ids):
         hidden_states = self.embed_tokens(input_ids)
 
@@ -586,6 +600,36 @@ class Model(nn.Module):
             hidden_states = self.layers[i](hidden_states, sin_table, cos_table)
 
         return self.norm(hidden_states)
+    '''
+    def forward(self, input_ids, past_key_values=None):
+        hidden_states = self.embed_tokens(input_ids)
+        batch_size, seq_len = input_ids.shape
+        
+        # 计算当前的 past_length (已经生成的长度)
+        past_length = 0
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+
+        # 生成完整的 RoPE 表 (或者只生成需要的切片)
+        # 这里为了简单，我们重新生成并切片
+        total_length = past_length + seq_len
+        sin_table, cos_table = generate_sin_and_cos_tables(
+            total_length, self.head_dim, self.rope_theta, 
+            hidden_states.dtype, hidden_states.device
+        )
+        # 只取当前位置对应的 RoPE (从 past_length 开始)
+        sin_table = sin_table[past_length:]
+        cos_table = cos_table[past_length:]
+
+        next_cache = []
+        for i in range(self.num_hidden_layers):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            hidden_states, cache = self.layers[i](
+                hidden_states, sin_table, cos_table, past_kv
+            )
+            next_cache.append(cache)
+
+        return self.norm(hidden_states), next_cache
 
 
 class ModelForCausalLM(nn.Module):
@@ -595,7 +639,7 @@ class ModelForCausalLM(nn.Module):
         self.model = Model(config)
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+    '''
     def generate(self, input_ids, max_new_tokens=20):
         for _ in range(max_new_tokens):
             hidden_states = self.model(input_ids)
@@ -607,7 +651,30 @@ class ModelForCausalLM(nn.Module):
             input_ids = torch.cat((input_ids, next), dim=-1)
 
         return input_ids
+    '''
+    def generate(self, input_ids, max_new_tokens=20):
+        past_key_values = None
+        
+        for _ in range(max_new_tokens):
+            # 如果是第一步(prefill)，使用完整的 input_ids
+            # 如果是后续步骤(decode)，只使用最新的 token (形状 [Batch, 1])
+            if past_key_values is None:
+                model_inputs = input_ids
+            else:
+                model_inputs = input_ids[:, -1:]
 
+            # 前向传播，获取 logits 和 新的 cache
+            hidden_states, past_key_values = self.model(model_inputs, past_key_values)
+            
+            # 只需要最后一个 token 的 logits
+            logits = self.lm_head(hidden_states[:, -1, :])
+            next_token = torch.argmax(logits, dim=-1).unsqueeze(-1)
+            
+            # 拼接结果
+            input_ids = torch.cat((input_ids, next_token), dim=-1)
+
+        return input_ids
+    
     @staticmethod
     def from_pretrained(model_path):
         model_path = Path(model_path)
