@@ -151,6 +151,100 @@ class MLP(nn.Module):
         return self.down_proj(fused_out)
 
 # 加速点三 
+@triton.jit
+def softmax_kernel(
+    output_ptr, input_ptr,
+    stride_b, stride_h, stride_m, stride_n,  # Strides
+    n_rows, n_cols,                          # Dimensions
+    scale,                                   # 缩放因子 (1/sqrt(dim))
+    BLOCK_SIZE: tl.constexpr
+):
+    # Softmax 是按行处理的
+    # 每一行对应一个 query 对所有 keys 的注意力分数
+    row_idx = tl.program_id(0)
+    
+    # 1. 处理数据指针
+    # 当前行的起始位置
+    # 这里假设输入是连续的或者我们处理好了 stride
+    # 实际 input_ptr 是 (Batch, Head, Seq_Q, Seq_K)
+    # 我们把前三维合并视为 n_rows
+    
+    row_start_ptr = input_ptr + row_idx * stride_n
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+    
+    # 2. 加载数据并应用 Scale
+    # 这里的 input 已经是 Q @ K.T 的结果
+    input_ptrs = row_start_ptr + col_offsets
+    row = tl.load(input_ptrs, mask=mask, other=-float('inf')).to(tl.float32)
+    row = row * scale
+    
+    # 3. 应用 Causal Mask (因果掩码)
+    # 在 Llama 推理中，我们需要 mask 掉未来的位置
+    # row_idx 代表当前的 query 位置 (在整个 batch*head*seq 中)
+    # 这是一个稍微复杂点的地方：我们需要知道当前处理的是第几个 token (curr_seq) 
+    # 和 key 的第几个 token (curr_col)。
+    # 如果 col > row，则 mask。
+    
+    # 为了简化，如果你的 Attention 代码里已经传了 mask 好的 tensor 进来，
+    # 那这个 kernel 就只做 Softmax。
+    # 但为了极致性能，我们应该在这里算 mask。
+    # 鉴于作业时间，我们先做一个通用的 "Safe Softmax"，
+    # 它接受已经 masked 的输入（或者我们在外层做 mask），主要加速 softmax 本身。
+    
+    # 4. 在线 Softmax (Online Softmax) 算法
+    # 它可以数值稳定地计算 softmax，不需要两遍扫描
+    
+    # 步骤 A: 找最大值 (用于数值稳定性)
+    row_max = tl.max(row, axis=0)
+    
+    # 步骤 B: 减去最大值并计算指数
+    # 这里的 sub 和 exp 是融合的
+    numerator = tl.exp(row - row_max)
+    
+    # 步骤 C: 求和
+    denominator = tl.sum(numerator, axis=0)
+    
+    # 步骤 D: 归一化
+    output = numerator / denominator
+    
+    # 5. 写回
+    output_ptrs = output_ptr + row_idx * stride_n
+    tl.store(output_ptrs, output, mask=mask)
+
+def triton_softmax(x, scale=1.0):
+    # x shape: (Batch, Heads, Seq_Q, Seq_K)
+    # 展平前三维，只对最后一维做 Softmax
+    n_rows = x.numel() // x.shape[-1]
+    n_cols = x.shape[-1]
+    
+    out = torch.empty_like(x)
+    
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    
+    # 我们需要更细致的 stride 处理吗？
+    # 如果 x 是连续的，stride_n 就是 1，stride_m 就是 n_cols
+    # 为了通用性：
+    # 这里的 kernel 定义稍微简单了点，假设了 row 是连续的内存块
+    # 对于 Attention Score 矩阵，通常最后一维是连续的
+    
+    grid = (n_rows, )
+    
+    # 计算 stride
+    # 实际上我们把 input 视为 (n_rows, n_cols) 的 2D 矩阵
+    # stride_row = x.stride(-2)
+    # stride_col = x.stride(-1)
+    
+    softmax_kernel[grid](
+        out, x,
+        0, 0, x.stride(-2), x.stride(-1), # stride_b, h 没用到，直接传占位
+        n_rows, n_cols,
+        scale,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    return out
+
+# 加速点四
 # ==========================================
 # Triton RoPE (旋转位置编码) 融合算子
 # ==========================================
@@ -363,6 +457,7 @@ def apply_scaled_dot_product_attention(query, key, value):
     value = value.repeat_interleave(num_heads_q // num_heads_v, 1)
 
     scale = 1 / math.sqrt(emb_dim)
+    '''
     attn_mask = torch.tril(
         torch.full((seq_len_q, seq_len_k), True, device=query.device)
     )
@@ -372,6 +467,28 @@ def apply_scaled_dot_product_attention(query, key, value):
     attn_output = torch.softmax(attn_output, dim=-1)
     attn_output = torch.matmul(attn_output, value)
 
+    return attn_output
+    '''
+    # 1. Q @ K.T
+    # 这一步目前还是用 torch.matmul，因为写 FP16 GEMM 很难
+    attn_weights = torch.matmul(query, key.permute(0, 1, 3, 2))
+    
+    # 2. 应用 Mask (PyTorch 原生)
+    # 如果要极致加速，这一步应该融合进 Softmax，但逻辑较复杂
+    # 我们先保留这一步，但去掉后面的 * scale 和 softmax
+    attn_mask = torch.tril(
+        torch.full((seq_len_q, seq_len_k), True, device=query.device)
+    )
+    attn_weights = torch.where(attn_mask, attn_weights, float("-inf"))
+    
+    # 3. Triton Softmax (融合了 Scale * x 和 Softmax)
+    # 替换原来的: 
+    # attn_output = torch.softmax(attn_weights * scale, dim=-1)
+    attn_weights = triton_softmax(attn_weights, scale=scale)
+    
+    # 4. Score @ V
+    attn_output = torch.matmul(attn_weights, value)
+    
     return attn_output
 
 
