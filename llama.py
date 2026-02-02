@@ -10,6 +10,31 @@ from safetensors.torch import load_file
 import triton
 import triton.language as tl
 
+import ninetoothed
+
+@dataclasses.dataclass
+class ModelConfig:
+    head_dim: int
+
+    hidden_size: int
+
+    intermediate_size: int
+
+    num_attention_heads: int
+
+    num_hidden_layers: int
+
+    num_key_value_heads: int
+
+    rms_norm_eps: float
+
+    rope_theta: float
+
+    torch_dtype: str
+
+    vocab_size: int
+
+
 @triton.jit
 def rms_norm_kernel(
     X, Y, W, 
@@ -34,29 +59,6 @@ def rms_norm_kernel(
     y = x * rsqrt * w
     
     tl.store(Y + cols, y, mask=mask)
-
-
-@dataclasses.dataclass
-class ModelConfig:
-    head_dim: int
-
-    hidden_size: int
-
-    intermediate_size: int
-
-    num_attention_heads: int
-
-    num_hidden_layers: int
-
-    num_key_value_heads: int
-
-    rms_norm_eps: float
-
-    rope_theta: float
-
-    torch_dtype: str
-
-    vocab_size: int
 
 
 class RMSNorm(nn.Module):
@@ -84,6 +86,23 @@ class RMSNorm(nn.Module):
             )
             return y.view(*orig_shape)
 
+
+# 定义九齿算子逻辑
+def ninetoothed_mlp_op(gate: ninetoothed.Tensor, up: ninetoothed.Tensor, out: nt.Tensor):
+    # 九齿的 Python 接口通常使用这种映射方式
+    # 这里的 i 是全局索引
+    i = nt.index(0) 
+    
+    # 直接写逻辑，九齿会自动并行化
+    g = gate[i]
+    u = up[i]
+    
+    # SiLU 逻辑: x * sigmoid(x)
+    # 九齿内置了常见的数学函数
+    res = g * nt.sigmoid(g) * u
+    
+    out[i] = res
+    
 
 class MLP(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
