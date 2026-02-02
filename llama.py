@@ -86,7 +86,7 @@ class RMSNorm(nn.Module):
             )
             return y.view(*orig_shape)
 
-
+'''
 # 使用 jit 装饰器将 Python 函数编译为 GPU 算子
 @nt.jit
 def ninetoothed_mlp_op(gate, up, out):
@@ -95,7 +95,7 @@ def ninetoothed_mlp_op(gate, up, out):
     sig_g = 1.0 / (1.0 + nt.exp(-gate))
     out = (gate * sig_g) * up
     return out
-
+'''
 
 @triton.jit
 def mlp_fused_kernel(
