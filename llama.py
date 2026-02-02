@@ -418,7 +418,6 @@ def apply_scaled_dot_product_attention(query, key, value):
     _, num_heads_k, seq_len_k, _ = key.shape
     _, num_heads_v, _, _ = value.shape
 
-    # GQA 处理
     key = key.repeat_interleave(num_heads_q // num_heads_k, 1)
     value = value.repeat_interleave(num_heads_q // num_heads_v, 1)
 
@@ -427,7 +426,9 @@ def apply_scaled_dot_product_attention(query, key, value):
     # 1. Q @ K.T
     attn_weights = torch.matmul(query, key.permute(0, 1, 3, 2))
     
-    # 2. 应用 Mask (仅在 Prefill 阶段需要 causal mask)
+    # 2. 应用 Mask (关键修正！)
+    # 只有在 Prefill 阶段 (seq_len_q > 1) 才需要因果掩码
+    # 在 Decode 阶段 (seq_len_q == 1)，Query 应该能看到之前所有的 Key
     if seq_len_q > 1:
         attn_mask = torch.tril(
             torch.full((seq_len_q, seq_len_k), True, device=query.device)
@@ -471,7 +472,7 @@ class Attention(nn.Module):
             self.num_attention_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-    def forward(self, hidden_states, sin_table, cos_table):
+    def forward(self, hidden_states, sin_table, cos_table, past_key_value=None):
         batch_size, seq_len = hidden_states.shape[:2]
         hidden_shape = (batch_size, seq_len, -1, self.head_dim)
 
@@ -486,25 +487,17 @@ class Attention(nn.Module):
             key_states, sin_table, cos_table
         ).permute(0, 2, 1, 3)
 
-        # 加速点五
-        # KV Cache 逻辑
+        # KV Cache 拼接逻辑
         if past_key_value is not None:
-            # 如果有缓存，把新的 K, V 拼接到缓存后面
             past_key, past_value = past_key_value
             key_states = torch.cat((past_key, key_states), dim=2)
             value_states = torch.cat((past_value, value_states), dim=2)
-        # 更新当前的缓存 (供下一步使用)
+        
         current_key_value = (key_states, value_states)
 
         attn_output = apply_scaled_dot_product_attention(
             query_states, key_states, value_states
         )
-        
-        '''
-        return self.o_proj(
-            attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        )
-        '''
 
         return self.o_proj(
             attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
