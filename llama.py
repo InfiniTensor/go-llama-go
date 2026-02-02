@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 
 import ninetoothed as nt
+import ninetoothed.language as ntl
+from ninetoothed import Tensor
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -87,31 +89,41 @@ class RMSNorm(nn.Module):
             return y.view(*orig_shape)
 
 
-mlp_fusion_code = """
-extern "C" __global__ void mlp_fusion(float* gate, float* up, float* out, int n){
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i<n){
-        float g = gate[i];
-        float u = up[i];
-        // SiLU: x * sigmoid(x)
-        float sig = 1.0f / (1.0f + __expf(-g));
-        out[i] = g * sig * u;
-    }
-}
-"""
-mlp_kernel = nt.compile(mlp_fusion_code)
+# ==========================================
+# 九齿 MLP 融合算子 (原生 3D 版)
+# ==========================================
 
-def ninetoothed_mlp_fusion(gate, up):
-    n = gate.numel()
-    out = torch.empty_like(gate)
+# 1. 定义三个维度的块大小
+# 编译器会自动为每个维度寻找最优配置
+BS_0 = nt.block_size()  # Batch 维度的块大小
+BS_1 = nt.block_size()  # Seq 维度的块大小
+BS_2 = nt.block_size()  # Hidden 维度的块大小
+
+# 2. 定义 3D 排列 (Arrangement)
+def mlp_arrangement_3d(gate, up, out):
+    # 直接对 3D 张量 (Batch, Seq, Hidden) 进行切分
+    # tile 参数是一个三元组，对应三个维度
+    gate_tiled = gate.tile((BS_0, BS_1, BS_2))
+    up_tiled   = up.tile((BS_0, BS_1, BS_2))
+    out_tiled  = out.tile((BS_0, BS_1, BS_2))
     
-    # 设置执行配置 (Grid & Block)
-    block = 256
-    grid = (n + block - 1) // block
-    
-    # 启动 Kernel
-    mlp_kernel.launch(grid, block, gate, up, out, n)
-    return out
+    return gate_tiled, up_tiled, out_tiled
+
+# 3. 定义应用 (Application)
+# 这里的逻辑和 2D 版完全一样，因为应用函数是在“块”级别运作的
+def mlp_application(gate, up, out):
+    # SiLU(gate) * up
+    sigmoid_gate = 1.0 / (1.0 + ntl.exp(-gate))
+    res = gate * sigmoid_gate * up
+    out = res
+
+# 4. 构建 3D 内核
+# 关键点：这里声明输入是 Tensor(3)，即三维张量
+mlp_fused_kernel_3d = nt.make(
+    mlp_arrangement_3d, 
+    mlp_application, 
+    (Tensor(3), Tensor(3), Tensor(3))
+)
 
 
 @triton.jit
@@ -180,11 +192,16 @@ class MLP(nn.Module):
         # 3. 执行最后的下投影
         return self.down_proj(fused_out)
         '''
+        # input shape: (Batch, Seq, Hidden)
         gate_out = self.gate_proj(input)
         up_out = self.up_proj(input)
         
-        # 调用九齿优化版
-        fused_out = ninetoothed_mlp_fusion(gate_out, up_out)
+        # 准备输出张量
+        fused_out = torch.empty_like(gate_out)
+        
+        # 直接传入 3D 张量！
+        # 九齿会自动识别 shape=(Batch, Seq, Dim) 并应用 mlp_arrangement_3d
+        mlp_fused_kernel_3d(gate_out, up_out, fused_out)
         
         return self.down_proj(fused_out)
         
