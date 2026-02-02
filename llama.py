@@ -633,12 +633,6 @@ class ModelForCausalLM(nn.Module):
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
     
-        # 加速点六
-        # 尝试编译模型主体 (如果环境支持)
-        try:
-            self.model = torch.compile(self.model)
-        except:
-            pass
     '''
     def generate(self, input_ids, max_new_tokens=20):
         for _ in range(max_new_tokens):
@@ -701,5 +695,12 @@ class ModelForCausalLM(nn.Module):
             state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
 
         model.load_state_dict(state_dict)
+
+        # 加速点六
+        try:
+            print("Compiling model with torch.compile...")
+            model.model = torch.compile(model.model)
+        except Exception as e:
+            print(f"Compilation failed, falling back to eager mode: {e}")
 
         return model
