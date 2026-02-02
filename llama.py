@@ -632,6 +632,13 @@ class ModelForCausalLM(nn.Module):
         self.model = Model(config)
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    
+        # 加速点六
+        # 尝试编译模型主体 (如果环境支持)
+        try:
+            self.model = torch.compile(self.model)
+        except:
+            pass
     '''
     def generate(self, input_ids, max_new_tokens=20):
         for _ in range(max_new_tokens):
