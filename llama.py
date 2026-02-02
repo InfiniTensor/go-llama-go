@@ -90,10 +90,12 @@ class RMSNorm(nn.Module):
 # 使用 jit 装饰器将 Python 函数编译为 GPU 算子
 @nt.jit
 def ninetoothed_mlp_op(gate, up, out):
-    # 九齿会自动处理并行索引
-    # 逻辑：out = silu(gate) * up
-    out[:] = gate * (1.0 / (1.0 + nt.exp(-gate))) * up
-    
+    # 计算 SiLU: x * (1 / (1 + exp(-x)))
+    # 直接使用 nt 提供的数学函数
+    sig_g = 1.0 / (1.0 + nt.exp(-gate))
+    out = (gate * sig_g) * up
+    return out
+
 
 @triton.jit
 def mlp_fused_kernel(
