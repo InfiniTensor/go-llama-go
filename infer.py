@@ -54,7 +54,9 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+
     tokenizer.pad_token = tokenizer.eos_token # add
+
 
     inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
 

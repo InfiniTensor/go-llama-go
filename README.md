@@ -12,8 +12,13 @@ python infer.py --help
 
 例如，我们可以通过以下命令，使用位于 `/data/shared/models/` 的 `Llama-3.2-1B` 模型推理两段 prompt。其中我们设定了推理最多只能生成 `64` 个新 token，并且运行在 `cuda` 设备上。该推理会总共进行 `4` 次，其中 `1` 次作为预热，其余 `3` 次用于性能测量。
 
+```Bash
+source /data/shared/miniconda3/etc/profile.d/conda.sh
+conda activate viz
+```
+
 ```shell
-python infer.py --model /data/shared/models/Llama-3.2-1B/ --prompts "The emergence of deep learning domain-specific languages (DSLs) has substantially reduced the obstacles in developing high-performance, cross-platform compute kernels, but current DSLs" "Driven by recent advancements in the AI industry, the AI accelerator sector has increasingly diversified, with vendors developing their own hardware architectures and programming models, such as NVIDIA" --max-new-tokens 64 --device cuda --num-warmup-iterations 1 --num-profiling-iterations 3
+python infer.py --model /data/shared/Llama-3.2-1B/ --prompts "The emergence of deep learning domain-specific languages (DSLs) has substantially reduced the obstacles in developing high-performance, cross-platform compute kernels, but current DSLs" "Driven by recent advancements in the AI industry, the AI accelerator sector has increasingly diversified, with vendors developing their own hardware architectures and programming models, such as NVIDIA" --max-new-tokens 64 --device cuda --num-warmup-iterations 1 --num-profiling-iterations 3
 ```
 
 以上命令运行结束后将打印出 JSON 格式的输出，其中 `"texts"` 里会存放所有输出的文本，`"num_tokens_per_second"` 会存放测量出的性能。
