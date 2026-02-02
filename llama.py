@@ -88,10 +88,10 @@ class RMSNorm(nn.Module):
 
 
 # 定义九齿算子逻辑
-def ninetoothed_mlp_op(gate: ninetoothed.Tensor, up: ninetoothed.Tensor, out: nt.Tensor):
+def ninetoothed_mlp_op(gate: ninetoothed.Tensor, up: ninetoothed.Tensor, out: ninetoothed.Tensor):
     # 九齿的 Python 接口通常使用这种映射方式
     # 这里的 i 是全局索引
-    i = nt.index(0) 
+    i = ninetoothed.index(0) 
     
     # 直接写逻辑，九齿会自动并行化
     g = gate[i]
@@ -99,7 +99,7 @@ def ninetoothed_mlp_op(gate: ninetoothed.Tensor, up: ninetoothed.Tensor, out: nt
     
     # SiLU 逻辑: x * sigmoid(x)
     # 九齿内置了常见的数学函数
-    res = g * nt.sigmoid(g) * u
+    res = g * ninetoothed.sigmoid(g) * u
     
     out[i] = res
     
