@@ -10,7 +10,7 @@ from safetensors.torch import load_file
 import triton
 import triton.language as tl
 
-import ninetoothed
+import ninetoothed as nt
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -87,21 +87,12 @@ class RMSNorm(nn.Module):
             return y.view(*orig_shape)
 
 
-# 定义九齿算子逻辑
-def ninetoothed_mlp_op(gate: ninetoothed.Tensor, up: ninetoothed.Tensor, out: ninetoothed.Tensor):
-    # 九齿的 Python 接口通常使用这种映射方式
-    # 这里的 i 是全局索引
-    i = ninetoothed.index(0) 
-    
-    # 直接写逻辑，九齿会自动并行化
-    g = gate[i]
-    u = up[i]
-    
-    # SiLU 逻辑: x * sigmoid(x)
-    # 九齿内置了常见的数学函数
-    res = g * ninetoothed.sigmoid(g) * u
-    
-    out[i] = res
+# 使用 jit 装饰器将 Python 函数编译为 GPU 算子
+@nt.jit
+def ninetoothed_mlp_op(gate, up, out):
+    # 九齿会自动处理并行索引
+    # 逻辑：out = silu(gate) * up
+    out[:] = gate * (1.0 / (1.0 + nt.exp(-gate))) * up
     
 
 @triton.jit
@@ -176,9 +167,8 @@ class MLP(nn.Module):
         # 准备输出张量
         fused_out = torch.empty_like(gate_out)
         
-        # 使用九齿执行融合逻辑
-        # execute 会根据张量大小自动分配 GPU 线程
-        ninetoothed.execute(ninetoothed_mlp_op)(gate_out, up_out, fused_out)
+        # 直接调用，九齿会根据 Tensor 的 shape 自动映射线程
+        ninetoothed_mlp_op(gate_out, up_out, fused_out)
         
         return self.down_proj(fused_out)
     
