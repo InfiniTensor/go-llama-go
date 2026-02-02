@@ -220,7 +220,7 @@ def apply_rotary_position_embedding(input, sin_table, cos_table):
     return triton_apply_rope(input, cos_table, sin_table)
 
 # ==========================================
-# Model Logic (Restored to Stateless)
+# Model Logic (Restored to Stateless) final
 # ==========================================
 
 def apply_scaled_dot_product_attention(query, key, value):
