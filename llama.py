@@ -104,6 +104,47 @@ def ninetoothed_mlp_op(gate: ninetoothed.Tensor, up: ninetoothed.Tensor, out: ni
     out[i] = res
     
 
+@triton.jit
+def mlp_fused_kernel(
+    gate_ptr, up_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    # 每个 program 处理一个连续的块
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # 加载 gate 和 up 的数据
+    g = tl.load(gate_ptr + offsets, mask=mask).to(tl.float32)
+    u = tl.load(up_ptr + offsets, mask=mask).to(tl.float32)
+
+    # 计算 SiLU: x * sigmoid(x)
+    # tl.sigmoid 在 Triton 中已内置
+    sig_g = tl.sigmoid(g)
+    res = (g * sig_g) * u
+
+    # 写回结果
+    tl.store(out_ptr + offsets, res, mask=mask)
+
+
+def triton_mlp_fusion(gate, up):
+    n_elements = gate.numel()
+    out = torch.empty_like(gate)
+    
+    # 定义并行网格，覆盖所有元素
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    mlp_fused_kernel[grid](
+        gate, up, out,
+        n_elements,
+        BLOCK_SIZE=1024 # 可以根据 GPU 规格调整
+    )
+    return out
+
+
+
 class MLP(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
@@ -117,8 +158,30 @@ class MLP(nn.Module):
         self.silu = nn.SiLU()
 
     def forward(self, input):
-        return self.down_proj(self.silu(self.gate_proj(input)) * self.up_proj(input))
-
+        #return self.down_proj(self.silu(self.gate_proj(input)) * self.up_proj(input))
+        '''
+        # 1. 执行前两个线性投影
+        gate_out = self.gate_proj(input)
+        up_out = self.up_proj(input)
+        
+        # 2. 调用 Triton 融合算子 (替代原来的 self.silu(gate_out) * up_out)
+        fused_out = triton_mlp_fusion(gate_out, up_out)
+        
+        # 3. 执行最后的下投影
+        return self.down_proj(fused_out)
+        '''
+        gate_out = self.gate_proj(input)
+        up_out = self.up_proj(input)
+        
+        # 准备输出张量
+        fused_out = torch.empty_like(gate_out)
+        
+        # 使用九齿执行融合逻辑
+        # execute 会根据张量大小自动分配 GPU 线程
+        ninetoothed.execute(ninetoothed_mlp_op)(gate_out, up_out, fused_out)
+        
+        return self.down_proj(fused_out)
+    
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
     sin_table = sin_table[None, :, None, :]
