@@ -7,34 +7,6 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 
-import triton
-import triton.language as tl
-
-@triton.jit
-def rms_norm_kernel(
-    X, Y, W, 
-    stride, n_cols, eps,
-    BLOCK_SIZE: tl.constexpr
-):
-    row_idx = tl.program_id(0)
-    X += row_idx * stride
-    Y += row_idx * stride
-
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < n_cols
-    
-    # 将整行数据载入 SRAM，减少 HBM 访问次数
-    x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
-    
-    # 算子融合：在寄存器中直接计算
-    var = tl.sum(x * x, axis=0) / n_cols
-    rsqrt = tl.math.rsqrt(var + eps)
-    
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
-    y = x * rsqrt * w
-    
-    tl.store(Y + cols, y, mask=mask)
-
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -68,21 +40,11 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, input):
-            # 记录原始形状以便最后还原
-            orig_shape = input.shape
-            # 将输入展平为 (num_rows, hidden_size) 以适配 Kernel
-            x = input.view(-1, orig_shape[-1])
-            M, N = x.shape
-            y = torch.empty_like(x)
-            BLOCK_SIZE = triton.next_power_of_2(N)
-            
-            # 启动 Triton Kernel
-            rms_norm_kernel[(M,)](
-                x, y, self.weight,
-                x.stride(0), N, self.eps,
-                BLOCK_SIZE=BLOCK_SIZE
-            )
-            return y.view(*orig_shape)
+        return (
+            input
+            * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            * self.weight
+        )
 
 
 class MLP(nn.Module):

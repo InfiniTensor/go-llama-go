@@ -5,7 +5,37 @@ import time
 import torch
 from transformers import AutoTokenizer
 
+import triton
+import triton.language as tl
+
 import llama
+
+
+@triton.jit
+def rms_norm_kernel(
+    X, Y, W, 
+    stride, n_cols, eps,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    X += row_idx * stride
+    Y += row_idx * stride
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+    
+    # 将整行数据载入 SRAM，减少 HBM 访问次数
+    x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+    
+    # 算子融合：在寄存器中直接计算
+    var = tl.sum(x * x, axis=0) / n_cols
+    rsqrt = tl.math.rsqrt(var + eps)
+    
+    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    y = x * rsqrt * w
+    
+    tl.store(Y + cols, y, mask=mask)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Text generation with a Llama model.")
